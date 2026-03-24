@@ -67,6 +67,29 @@ class ImageNet_R(ImageFolderDataset):
         return super().get_data()
 
 
+
+class MAR20(ImageFolderDataset):
+    """MAR20 ship classification dataset."""
+
+    def __init__(self, data_path, train=True, download=False):
+        super().__init__(data_path=data_path, train=train, download=download)
+
+    @property
+    def transformations(self):
+        return [
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        ]
+
+    def get_data(self):
+        if self.train:
+            self.data_path = os.path.join(self.data_path, "train")
+        else:
+            self.data_path = os.path.join(self.data_path, "test")
+        return super().get_data()
+
+
 def get_dataset(cfg, is_train, transforms=None):
     if cfg.dataset == "cifar100":
         # data_path = os.path.join(cfg.dataset_root, cfg.dataset)
@@ -108,6 +131,10 @@ def get_dataset(cfg, is_train, transforms=None):
             data_path, 
             train=is_train
         )
+        classes_names = get_dataset_class_names(cfg.workdir, cfg.dataset)
+    elif cfg.dataset == "mar20":
+        data_path = cfg.dataset_root
+        dataset = MAR20(data_path, train=is_train)
         classes_names = get_dataset_class_names(cfg.workdir, cfg.dataset)
     else:
         ValueError(f"'{cfg.dataset}' is a invalid dataset.")
