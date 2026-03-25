@@ -1,26 +1,30 @@
-#!bin/bash
+#!/bin/bash
+# RAPF experiments with DINOv2 fusion for FGVC-Aircraft
+# Usage: bash run_experiment.sh
 
-# python main.py \
-#     --config-path configs/class \
-#     --config-name imagenet100_10-10.yaml \
-#     dataset_root="[imagenet_1k_path]" \
-#     class_order="class_orders/imagenet100.yaml"
-#
-# python main.py \
-#     --config-path configs/class \
-#     --config-name imagenet_r_20-20.yaml \
-#     dataset_root="[imagenet_r_path]" \
-#     class_order="class_orders/imagenet_R_order.yaml"
-#
-# python main.py \
-#     --config-path configs/class \
-#     --config-name cifar100_10-10.yaml \
-#     dataset_root="[cifar100_path]" \
-#     class_order="class_orders/cifar100_order.yaml"
+export ALL_PROXY=127.0.0.1:7890
+PYTHON=/mnt/conda/envs/continual_clip/bin/python
+cd "$(dirname "$0")"
 
-python main.py \
+echo "=== FGVC-Aircraft CLIP Baseline (10-10) ==="
+$PYTHON main.py \
     --config-path configs/class \
-    --config-name imagenet100_10-10.yaml \
-    dataset_root="[imagenet_1k_path]" \
-    class_order="class_orders/imagenet100.yaml"
+    --config-name fgvc_10-10.yaml \
+    dataset_root=data/fgvc_aircraft \
+    class_order=class_orders/fgvc_aircraft_order.yaml
 
+echo ""
+echo "=== FGVC-Aircraft DINOv2 Fusion (10-10) ==="
+$PYTHON main.py \
+    --config-path configs/class \
+    --config-name fgvc_dino_10-10.yaml \
+    dataset_root=data/fgvc_aircraft \
+    class_order=class_orders/fgvc_aircraft_order.yaml
+
+echo ""
+echo "=== FGVC-Aircraft DINOv2 Fusion Shuffled (10-10) ==="
+$PYTHON main.py \
+    --config-path configs/class \
+    --config-name fgvc_dino_10-10.yaml \
+    dataset_root=data/fgvc_aircraft \
+    class_order=class_orders/fgvc_aircraft_order_shuffle.yaml

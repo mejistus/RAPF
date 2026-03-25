@@ -1,3 +1,4 @@
+import os
 
 
 import copy
@@ -216,6 +217,254 @@ class ClassIncrementalCLIP(nn.Module):
 
 
 
+
+class DINOv2Encoder(nn.Module):
+    """DINOv2 ViT-B/14 visual encoder (frozen)."""
+    def __init__(self, weights_path=None, device="cuda"):
+        super().__init__()
+        from functools import partial
+        # Build ViT-B/14 architecture matching DINOv2
+        self.patch_size = 14
+        self.embed_dim = 768
+        self.num_heads = 12
+        self.depth = 12
+
+        self.patch_embed = nn.Conv2d(3, self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 257, self.embed_dim))  # 16x16 + 1 cls
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim, nhead=self.num_heads,
+            dim_feedforward=self.embed_dim * 4, dropout=0.0,
+            activation="gelu", batch_first=True, norm_first=True
+        )
+        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=self.depth)
+        self.norm = nn.LayerNorm(self.embed_dim)
+        
+        if weights_path and os.path.exists(weights_path):
+            state_dict = torch.load(weights_path, map_location="cpu")
+            self.load_state_dict(state_dict, strict=False)
+            print(f"Loaded DINOv2 weights from {weights_path}")
+        
+        # Freeze all parameters
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = self.patch_embed(x)  # B, C, H, W
+        x = x.flatten(2).transpose(1, 2)  # B, N, C
+        cls = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        
+        # Interpolate pos_embed if needed
+        if x.shape[1] != self.pos_embed.shape[1]:
+            cls_pe = self.pos_embed[:, :1]
+            patch_pe = self.pos_embed[:, 1:]
+            N = x.shape[1] - 1
+            sqrt_N = int(N ** 0.5)
+            old_sqrt = int(patch_pe.shape[1] ** 0.5)
+            patch_pe = patch_pe.reshape(1, old_sqrt, old_sqrt, self.embed_dim).permute(0, 3, 1, 2)
+            patch_pe = nn.functional.interpolate(patch_pe, size=(sqrt_N, sqrt_N), mode="bicubic")
+            patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, -1, self.embed_dim)
+            pos_embed = torch.cat([cls_pe, patch_pe], dim=1)
+        else:
+            pos_embed = self.pos_embed
+        
+        x = x + pos_embed
+        x = self.blocks(x)
+        x = self.norm(x)
+        return x[:, 0]  # CLS token
+
+
+class ClassIncrementalDINO(nn.Module):
+    """CLIP text encoder + DINOv2 visual encoder + trainable projection adapter."""
+    def __init__(self, cfg, device, jit=False):
+        super().__init__()
+        self.cfg = cfg
+        self.prompt_template = cfg.prompt_template
+        self.device = device
+        self.classes_names = None
+        
+        # CLIP for text encoding only
+        clip_model, self.transforms = clip.load(cfg.model_name, device=device, jit=jit)
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.token_embedding = clip_model.token_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.logit_scale = clip_model.logit_scale
+        self.clip_type = clip_model.dtype
+        
+        # DINOv2 visual encoder (frozen) - use CLIP visual as fallback if no DINOv2 weights
+        dino_weights = getattr(cfg, 'dino_weights', '/mnt/datasets/dinov2_vitb14.pth')
+        if os.path.exists(dino_weights):
+            self.visual_encoder = "dino"
+            self.dino = DINOv2Encoder(dino_weights, device).to(device)
+            visual_dim = 768
+            print(f"Using DINOv2 visual encoder (dim={visual_dim})")
+        else:
+            self.visual_encoder = "clip"
+            self.visual = clip_model.visual
+            visual_dim = 512
+            print(f"DINOv2 weights not found, falling back to CLIP visual (dim={visual_dim})")
+        
+        # Projection: visual_dim -> 512 (CLIP text space)
+        self.adapter = nn.Linear(visual_dim, 512, bias=False, device=device)
+        
+        # Override transforms for DINOv2 (224x224, ImageNet normalization)
+        from torchvision import transforms as T
+        self.transforms = T.Compose([
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        ])
+        
+        self.class_ids_per_task = list(get_class_ids_per_task(cfg))
+        self.current_class_names = []
+        self.text_tokens = None
+        self.dtype = torch.float16 if cfg.fp16 else torch.float32
+
+        # old adapter
+        self.old_adapter = None
+        self.old_edge_samples = []
+        self.old_edge_samples_labels = []
+        self.old_edge_samples_nearest_labels = []
+
+        # class stat
+        self.class_mean_list = []
+        self.class_cov_list = []
+        self.class_diff = None
+        self.nearest_class = None
+        self.class_edge_distance = []
+        self.mix_b = cfg.mix_bias
+
+    def encode_text(self, text, prompt=False):
+        x = self.token_embedding(text).type(self.clip_type)
+        x = x + self.positional_embedding.type(self.clip_type)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        return x
+    
+    def encode_image(self, image):
+        if self.visual_encoder == "dino":
+            image = image.float()
+            return self.dino(image)
+        else:
+            image = image.to(self.clip_type)
+            return self.visual(image)
+
+    @torch.no_grad()
+    def get_class_name_features(self):
+        class_name_features = self.encode_text(self.text_tokens)
+        return class_name_features.type(torch.float32)
+
+    def forward(self, image, ori_ima_f=False, memory_data=None, not_ini=False, edge_sample=None, prompt=False):
+        with torch.no_grad():
+            text_features = self.encode_text(self.text_tokens)
+
+        with torch.no_grad():
+            image_features = self.encode_image(image)
+            original_image_features = image_features.clone()
+        if memory_data is not None:
+            memory_data = memory_data.type(self.dtype)
+            image_features = torch.cat([image_features, memory_data], dim=0)
+        if edge_sample is not None:
+            edge_sample = edge_sample.type(self.dtype)
+            edge_num = edge_sample.shape[0]
+            image_features = torch.cat([image_features, edge_sample], dim=0)
+
+        image_features = self.adapter(image_features.type(self.dtype).detach()).type(self.clip_type)
+
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        if edge_sample is not None:
+            edge_sample_features = image_features[-edge_num:]
+            image_features = image_features[:-edge_num]
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t().type(image_features.dtype)
+        
+        probs = logits_per_image
+        if not_ini:
+            with torch.no_grad():
+                old_memory_feature = self.old_adapter(memory_data)
+                old_memory_feature = old_memory_feature / old_memory_feature.norm(dim=1, keepdim=True)
+            if edge_sample is not None:
+                return probs, image_features, old_memory_feature, edge_sample_features
+            return probs, image_features, old_memory_feature, text_features
+        if ori_ima_f:
+            if memory_data is not None:
+                image_features = image_features[:-memory_data.shape[0]]
+            return probs, original_image_features, image_features
+        return probs, image_features, None, None
+
+    def adaptation(self, task_id, threshold=0):
+        self.current_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
+        self.text_tokens = clip.tokenize(
+            [self.prompt_template.format(c) for c in self.current_class_names]
+        ).to(self.device)
+        self.text_end = self.text_tokens.max(dim=-1)[1]
+        self.class_name_features = self.get_class_name_features()
+        self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
+        self.queue_empty = True
+        self.hard_pairs = None
+        if task_id > 0:
+            self.old_adapter = copy.deepcopy(self.adapter)
+            dist_list = []
+            for k, class_name_feature in enumerate(self.class_name_features[:-len(self.class_ids_per_task[task_id])]):
+                diff = torch.cdist(self.class_name_features[-len(self.class_ids_per_task[task_id]):].type(torch.float32), class_name_feature.unsqueeze(0).type(torch.float32)).squeeze()
+                dist_list.append(diff)
+            dist_list = torch.stack(dist_list)
+            self.class_diff = dist_list
+            mask = self.class_diff < threshold
+            indices = torch.nonzero(mask)
+            self.hard_new_class = torch.unique(indices[:,1]) + self.cfg.initial_increment+(task_id-1) * self.cfg.increment
+            num_hard_class = self.hard_new_class.shape[0]
+            self.hard_pairs = indices
+            self.hard_pairs[:,1] = self.hard_pairs[:,1]+self.cfg.initial_increment+(task_id-1) * self.cfg.increment
+
+    def get_old_edge_samples(self, batch_size):
+        random_select = torch.randperm(self.old_edge_samples.shape[0])[:batch_size]
+        return self.old_edge_samples[random_select], self.old_edge_samples_labels[random_select], self.old_edge_samples_nearest_labels[random_select]
+
+    def analyze_mean_cov(self, features, labels):
+        label = torch.sort(torch.unique(labels))[0]
+        for l in label:
+            index = torch.nonzero(labels == l).squeeze()
+            class_data = features[index]
+            if class_data.dim() == 1:
+                class_data = class_data.unsqueeze(0)
+            mean = class_data.mean(dim=0)
+            cov = torch.cov(class_data.t()) + 1e-4 * torch.eye(class_data.shape[-1], device=class_data.device)
+            distance = torch.cdist(class_data, mean.unsqueeze(0)).squeeze()
+            if distance.dim() == 0:
+                distance = distance.unsqueeze(0)
+            max_distance = torch.sort(distance)[0][-min(10, len(distance)):]
+            self.class_edge_distance.append((max_distance.mean()-max_distance.min(), max_distance.max() - max_distance.mean(), max_distance.mean()))
+            self.class_mean_list.append(mean)
+            self.class_cov_list.append(cov)
+
+    def mix_matrix(self):
+        if self.old_adapter is not None:
+            weight_new = self.adapter.weight.data
+            weight_old = self.old_adapter.weight.data
+            dist = (weight_new - weight_old).abs()
+            U_old, S_old, V_old = torch.linalg.svd(weight_old)
+            P_new = U_old.T @ weight_new
+            dist = (P_new - torch.diag(S_old)@V_old).abs()
+            mask = dist / dist.max()
+            mask += self.mix_b
+            mask = torch.clamp(mask, max=1)
+            right = P_new * mask + torch.diag(S_old)@V_old * (1-mask)
+            weight = U_old @ right
+            self.adapter.weight.data = weight
+            return
+
+
 class DomainIncrementalCLIP(nn.Module):
     def __init__(self, cfg, device, jit=False) -> None:
         super().__init__()
@@ -253,6 +502,9 @@ def load_model(cfg: DictConfig, device: torch.device) -> nn.Module:
         nn.Module: Return scenario specific CLIP model.
     """
     if cfg.scenario == "class":
+        use_dino = getattr(cfg, 'use_dino', False)
+        if use_dino:
+            return ClassIncrementalDINO(cfg, device)
         return ClassIncrementalCLIP(cfg, device)
     elif cfg.scenario == "domain":
         return DomainIncrementalCLIP(cfg, device)
