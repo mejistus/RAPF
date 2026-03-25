@@ -485,14 +485,15 @@ class ClassIncrementalDINO(nn.Module):
         if self.old_adapter is not None:
             weight_new = self.adapter.weight.data
             weight_old = self.old_adapter.weight.data
-            dist = (weight_new - weight_old).abs()
-            U_old, S_old, V_old = torch.linalg.svd(weight_old)
-            P_new = U_old.T @ weight_new
-            dist = (P_new - torch.diag(S_old)@V_old).abs()
-            mask = dist / dist.max()
+            U_old, S_old, V_old = torch.linalg.svd(weight_old, full_matrices=False)
+            # U_old: [out, k], S_old: [k], V_old: [k, in] where k=min(out, in)
+            P_new = U_old.T @ weight_new  # [k, in]
+            S_diag_V = torch.diag(S_old) @ V_old  # [k, in]
+            dist = (P_new - S_diag_V).abs()
+            mask = dist / (dist.max() + 1e-8)
             mask += self.mix_b
             mask = torch.clamp(mask, max=1)
-            right = P_new * mask + torch.diag(S_old)@V_old * (1-mask)
+            right = P_new * mask + S_diag_V * (1 - mask)
             weight = U_old @ right
             self.adapter.weight.data = weight
             return
