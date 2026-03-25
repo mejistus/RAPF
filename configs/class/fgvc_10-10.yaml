@@ -14,7 +14,7 @@ dataset_root: ""
 workdir: ""
 log_path: "metric.json"
 model_name: "ViT-B/16"
-prompt_template: "a photo of a {}."
+prompt_template: "a photo of a {} aircraft."
 
 batch_size: 128
 initial_increment: 10
