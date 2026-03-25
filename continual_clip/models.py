@@ -329,20 +329,19 @@ class ClassIncrementalDINO(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.clip_type = clip_model.dtype
         
-        # DINOv2 visual encoder (frozen) - use CLIP visual as fallback if no DINOv2 weights
+        # Both CLIP visual (512d) and DINOv2 (768d) - concatenated features
+        self.visual = clip_model.visual  # CLIP visual encoder (frozen)
         dino_weights = getattr(cfg, 'dino_weights', '/mnt/datasets/dinov2_vitb14.pth')
-        if os.path.exists(dino_weights):
-            self.visual_encoder = "dino"
+        self.use_dino = os.path.exists(dino_weights)
+        if self.use_dino:
             self.dino = DINOv2Encoder(dino_weights, device).to(device)
-            visual_dim = 768
-            print(f"Using DINOv2 visual encoder (dim={visual_dim})")
+            visual_dim = 512 + 768  # CLIP + DINOv2 concatenated
+            print(f"Using CLIP+DINOv2 fusion (dim={visual_dim})")
         else:
-            self.visual_encoder = "clip"
-            self.visual = clip_model.visual
             visual_dim = 512
-            print(f"DINOv2 weights not found, falling back to CLIP visual (dim={visual_dim})")
+            print(f"DINOv2 not found, using CLIP only (dim={visual_dim})")
         
-        # Projection: visual_dim -> 512 (CLIP text space)
+        # Projection: concat_dim -> 512 (CLIP text space)
         self.adapter = nn.Linear(visual_dim, 512, bias=False, device=device)
         
         # Override transforms for DINOv2 (224x224, ImageNet normalization)
@@ -383,12 +382,12 @@ class ClassIncrementalDINO(nn.Module):
         return x
     
     def encode_image(self, image):
-        if self.visual_encoder == "dino":
-            image = image.float()
-            return self.dino(image)
-        else:
-            image = image.to(self.clip_type)
-            return self.visual(image)
+        # Always use CLIP visual
+        clip_feat = self.visual(image.to(self.clip_type)).float()
+        if self.use_dino:
+            dino_feat = self.dino(image.float())
+            return torch.cat([clip_feat, dino_feat], dim=-1)  # [B, 1280]
+        return clip_feat
 
     @torch.no_grad()
     def get_class_name_features(self):
