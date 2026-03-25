@@ -219,62 +219,95 @@ class ClassIncrementalCLIP(nn.Module):
 
 
 class DINOv2Encoder(nn.Module):
-    """DINOv2 ViT-B/14 visual encoder (frozen)."""
+    """DINOv2 ViT-B/14 visual encoder (frozen). Loads from pretrained checkpoint."""
     def __init__(self, weights_path=None, device="cuda"):
         super().__init__()
-        from functools import partial
-        # Build ViT-B/14 architecture matching DINOv2
-        self.patch_size = 14
         self.embed_dim = 768
-        self.num_heads = 12
-        self.depth = 12
-
-        self.patch_embed = nn.Conv2d(3, self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 257, self.embed_dim))  # 16x16 + 1 cls
         
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim, nhead=self.num_heads,
-            dim_feedforward=self.embed_dim * 4, dropout=0.0,
-            activation="gelu", batch_first=True, norm_first=True
+        # Build a minimal DINOv2 ViT-B/14 
+        # patch_size=14, embed_dim=768, depth=12, num_heads=12
+        from torchvision.models.vision_transformer import VisionTransformer
+        self.vit = VisionTransformer(
+            image_size=224, patch_size=14, 
+            num_layers=12, num_heads=12, 
+            hidden_dim=768, mlp_dim=768*4,
+            num_classes=0,  # no classification head
         )
-        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=self.depth)
-        self.norm = nn.LayerNorm(self.embed_dim)
         
         if weights_path and os.path.exists(weights_path):
             state_dict = torch.load(weights_path, map_location="cpu")
-            self.load_state_dict(state_dict, strict=False)
-            print(f"Loaded DINOv2 weights from {weights_path}")
+            # Map DINOv2 keys to torchvision ViT keys
+            new_sd = {}
+            for k, v in state_dict.items():
+                # patch_embed
+                if k == "patch_embed.proj.weight":
+                    new_sd["conv_proj.weight"] = v
+                elif k == "patch_embed.proj.bias":
+                    new_sd["conv_proj.bias"] = v
+                elif k == "cls_token":
+                    new_sd["class_token"] = v
+                elif k == "pos_embed":
+                    # DINOv2 pos_embed: [1, 1370, 768] -> interpolate to [1, 257, 768]
+                    cls_pe = v[:, :1]
+                    patch_pe = v[:, 1:]
+                    # 37x37 -> 16x16
+                    old_size = int(patch_pe.shape[1] ** 0.5)  # 37
+                    patch_pe = patch_pe.reshape(1, old_size, old_size, 768).permute(0, 3, 1, 2)
+                    patch_pe = nn.functional.interpolate(patch_pe, size=(16, 16), mode="bicubic", align_corners=False)
+                    patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, 256, 768)
+                    new_sd["encoder.pos_embedding"] = torch.cat([cls_pe, patch_pe], dim=1)
+                elif k.startswith("blocks."):
+                    # blocks.0.attn.qkv.weight -> encoder.layers.encoder_layer_0.self_attention...
+                    parts = k.split(".")
+                    layer_idx = parts[1]
+                    rest = ".".join(parts[2:])
+                    prefix = f"encoder.layers.encoder_layer_{layer_idx}"
+                    
+                    if rest == "norm1.weight":
+                        new_sd[f"{prefix}.ln_1.weight"] = v
+                    elif rest == "norm1.bias":
+                        new_sd[f"{prefix}.ln_1.bias"] = v
+                    elif rest == "norm2.weight":
+                        new_sd[f"{prefix}.ln_2.weight"] = v
+                    elif rest == "norm2.bias":
+                        new_sd[f"{prefix}.ln_2.bias"] = v
+                    elif rest == "attn.qkv.weight":
+                        new_sd[f"{prefix}.self_attention.in_proj_weight"] = v
+                    elif rest == "attn.qkv.bias":
+                        new_sd[f"{prefix}.self_attention.in_proj_bias"] = v
+                    elif rest == "attn.proj.weight":
+                        new_sd[f"{prefix}.self_attention.out_proj.weight"] = v
+                    elif rest == "attn.proj.bias":
+                        new_sd[f"{prefix}.self_attention.out_proj.bias"] = v
+                    elif rest == "mlp.fc1.weight":
+                        new_sd[f"{prefix}.mlp.0.weight"] = v
+                    elif rest == "mlp.fc1.bias":
+                        new_sd[f"{prefix}.mlp.0.bias"] = v
+                    elif rest == "mlp.fc2.weight":
+                        new_sd[f"{prefix}.mlp.3.weight"] = v
+                    elif rest == "mlp.fc2.bias":
+                        new_sd[f"{prefix}.mlp.3.bias"] = v
+                elif k == "norm.weight":
+                    new_sd["encoder.ln.weight"] = v
+                elif k == "norm.bias":
+                    new_sd["encoder.ln.bias"] = v
+            
+            missing, unexpected = self.vit.load_state_dict(new_sd, strict=False)
+            loaded = len(new_sd) - len(unexpected)
+            print(f"Loaded DINOv2: {loaded} params mapped, {len(missing)} missing, {len(unexpected)} unexpected")
         
         # Freeze all parameters
-        for p in self.parameters():
+        for p in self.vit.parameters():
             p.requires_grad = False
 
     def forward(self, x):
-        B = x.shape[0]
-        x = self.patch_embed(x)  # B, C, H, W
-        x = x.flatten(2).transpose(1, 2)  # B, N, C
-        cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1)
-        
-        # Interpolate pos_embed if needed
-        if x.shape[1] != self.pos_embed.shape[1]:
-            cls_pe = self.pos_embed[:, :1]
-            patch_pe = self.pos_embed[:, 1:]
-            N = x.shape[1] - 1
-            sqrt_N = int(N ** 0.5)
-            old_sqrt = int(patch_pe.shape[1] ** 0.5)
-            patch_pe = patch_pe.reshape(1, old_sqrt, old_sqrt, self.embed_dim).permute(0, 3, 1, 2)
-            patch_pe = nn.functional.interpolate(patch_pe, size=(sqrt_N, sqrt_N), mode="bicubic")
-            patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, -1, self.embed_dim)
-            pos_embed = torch.cat([cls_pe, patch_pe], dim=1)
-        else:
-            pos_embed = self.pos_embed
-        
-        x = x + pos_embed
-        x = self.blocks(x)
-        x = self.norm(x)
-        return x[:, 0]  # CLS token
+        # Extract features from encoder, bypassing classification head
+        x = self.vit._process_input(x)
+        n = x.shape[0]
+        batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        x = self.vit.encoder(x)
+        return x[:, 0]  # CLS token, shape [B, 768]
 
 
 class ClassIncrementalDINO(nn.Module):
