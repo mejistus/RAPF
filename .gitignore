@@ -129,3 +129,5 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+lora_cl/output*/best_model*.pth
+lora_cl/output-*/best_stage*.pth
