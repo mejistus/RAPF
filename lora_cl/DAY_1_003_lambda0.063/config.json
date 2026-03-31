@@ -1,0 +1,22 @@
+{
+  "data_root": "../data/fgvc_aircraft",
+  "dino_weights": "/mnt/datasets/dinov2_vitb14.pth",
+  "lora_rank": 8,
+  "proj_dim": 128,
+  "P": 8,
+  "K": 8,
+  "epochs": 80,
+  "lr": 0.001,
+  "lr_lora": 0.0005,
+  "warmup_epochs": 5,
+  "temperature": 0.1,
+  "local_weight": 0.5,
+  "label_smoothing": 0.1,
+  "weight_decay": 0.0005,
+  "num_workers": 4,
+  "seed": 42,
+  "grad_clip": 1.0,
+  "lambda_cl": 0.063,
+  "exp_id": 3,
+  "output_dir": "DAY_1_003_lambda0.063"
+}

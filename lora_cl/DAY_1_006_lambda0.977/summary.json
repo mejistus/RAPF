@@ -1,0 +1,7 @@
+{
+  "lambda": 0.977,
+  "best_test_acc": 81.72817281728173,
+  "exp_id": 6,
+  "final_test_acc": 81.66816681668166,
+  "total_time_min": 27.56195675532023
+}
