@@ -1,0 +1,70 @@
+{
+  "model": "DAY_1_006 \u03bb=0.977",
+  "test_acc": 81.72817281728173,
+  "mean_per_class_acc": 81.68983957219251,
+  "std_per_class_acc": 16.8030316030782,
+  "classes_below_50": 4,
+  "classes_above_90": 46,
+  "top_confused": [
+    [
+      "747-100",
+      "747-200",
+      16
+    ],
+    [
+      "737-300",
+      "737-500",
+      15
+    ],
+    [
+      "BAE_146-200",
+      "BAE_146-300",
+      15
+    ],
+    [
+      "DC-3",
+      "C-47",
+      15
+    ],
+    [
+      "C-47",
+      "DC-3",
+      12
+    ],
+    [
+      "A340-200",
+      "A340-300",
+      10
+    ],
+    [
+      "ERJ_145",
+      "ERJ_135",
+      10
+    ],
+    [
+      "747-300",
+      "747-400",
+      9
+    ],
+    [
+      "A320",
+      "A319",
+      9
+    ],
+    [
+      "MD-11",
+      "DC-10",
+      9
+    ]
+  ],
+  "files": [
+    "attention_maps.png",
+    "per_class_accuracy.png",
+    "badcases_vs_gt.png",
+    "tsne.png",
+    "confusion_matrix.png",
+    "training_curves.png",
+    "class_clustering.png",
+    "confused_pairs.txt"
+  ]
+}

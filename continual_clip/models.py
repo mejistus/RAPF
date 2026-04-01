@@ -9,7 +9,8 @@ import clip
 import torch
 import torch.nn as nn
 
-from .utils import get_class_ids_per_task, get_class_names
+from .utils import get_class_ids_per_task, get_class_names, get_aircraft_descriptive_name
+from .lora import LoRALinear, inject_lora, get_lora_state_dict, load_lora_state_dict
 
 class Mlp(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim):
@@ -158,9 +159,16 @@ class ClassIncrementalCLIP(nn.Module):
 
     def adaptation(self, task_id, threshold=0):
         self.current_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
-        self.text_tokens = clip.tokenize(
-            [self.prompt_template.format(c) for c in self.current_class_names]
-        ).to(self.device)
+        # Use descriptive names for FGVC-Aircraft if available
+        if self.cfg.dataset == "fgvc_aircraft":
+            descriptive_names = [get_aircraft_descriptive_name(c) for c in self.current_class_names]
+            self.text_tokens = clip.tokenize(
+                [self.prompt_template.format(c) for c in descriptive_names]
+            ).to(self.device)
+        else:
+            self.text_tokens = clip.tokenize(
+                [self.prompt_template.format(c) for c in self.current_class_names]
+            ).to(self.device)
         self.text_end = self.text_tokens.max(dim=-1)[1]
         self.class_name_features = self.get_class_name_features()
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
@@ -218,96 +226,127 @@ class ClassIncrementalCLIP(nn.Module):
 
 
 
+class DINOv2Attention(nn.Module):
+    def __init__(self, dim=768, num_heads=12):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
+
+
+class DINOv2MLP(nn.Module):
+    def __init__(self, dim=768, hidden_dim=3072):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class DINOv2Block(nn.Module):
+    def __init__(self, dim=768, num_heads=12, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = DINOv2Attention(dim, num_heads)
+        self.ls1 = nn.Parameter(torch.ones(dim))
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = DINOv2MLP(dim, int(dim * mlp_ratio))
+        self.ls2 = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        x = x + self.ls1 * self.attn(self.norm1(x))
+        x = x + self.ls2 * self.mlp(self.norm2(x))
+        return x
+
+
 class DINOv2Encoder(nn.Module):
-    """DINOv2 ViT-B/14 visual encoder (frozen). Loads from pretrained checkpoint."""
-    def __init__(self, weights_path=None, device="cuda"):
+    """Native DINOv2 ViT-B/14 encoder that matches the official checkpoint structure."""
+    def __init__(self, weights_path=None, device="cuda", input_size=224):
         super().__init__()
         self.embed_dim = 768
-        
-        # Build a minimal DINOv2 ViT-B/14 
-        # patch_size=14, embed_dim=768, depth=12, num_heads=12
-        from torchvision.models.vision_transformer import VisionTransformer
-        self.vit = VisionTransformer(
-            image_size=224, patch_size=14, 
-            num_layers=12, num_heads=12, 
-            hidden_dim=768, mlp_dim=768*4,
-            num_classes=0,  # no classification head
-        )
-        
+        self.patch_size = 14
+        self.input_size = input_size
+        num_patches = (input_size // self.patch_size) ** 2  # 256 for 224x224
+
+        self.patch_embed = nn.Sequential()
+        self.patch_embed.proj = nn.Conv2d(3, 768, kernel_size=14, stride=14)
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, 768))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, 768))
+
+        self.blocks = nn.ModuleList([DINOv2Block(768, 12, 4.0) for _ in range(12)])
+        self.norm = nn.LayerNorm(768)
+
         if weights_path and os.path.exists(weights_path):
-            state_dict = torch.load(weights_path, map_location="cpu")
-            # Map DINOv2 keys to torchvision ViT keys
+            state_dict = torch.load(weights_path, map_location="cpu", weights_only=False)
+            # Remove mask_token (not needed for inference)
+            state_dict.pop("mask_token", None)
+
+            # Interpolate pos_embed from training resolution to input resolution
+            pos_embed = state_dict["pos_embed"]  # [1, 1370, 768]
+            cls_pe = pos_embed[:, :1]  # [1, 1, 768]
+            patch_pe = pos_embed[:, 1:]  # [1, 1369, 768]
+            old_size = int(patch_pe.shape[1] ** 0.5)  # 37
+            new_size = input_size // self.patch_size  # 16
+            patch_pe = patch_pe.reshape(1, old_size, old_size, 768).permute(0, 3, 1, 2)
+            patch_pe = nn.functional.interpolate(
+                patch_pe.float(), size=(new_size, new_size), mode="bicubic", align_corners=False
+            )
+            patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, new_size * new_size, 768)
+            state_dict["pos_embed"] = torch.cat([cls_pe, patch_pe], dim=1)
+
+            # Rename ls1.gamma/ls2.gamma -> blocks.X.ls1/ls2
             new_sd = {}
             for k, v in state_dict.items():
-                # patch_embed
-                if k == "patch_embed.proj.weight":
-                    new_sd["conv_proj.weight"] = v
-                elif k == "patch_embed.proj.bias":
-                    new_sd["conv_proj.bias"] = v
-                elif k == "cls_token":
-                    new_sd["class_token"] = v
-                elif k == "pos_embed":
-                    # DINOv2 pos_embed: [1, 1370, 768] -> interpolate to [1, 257, 768]
-                    cls_pe = v[:, :1]
-                    patch_pe = v[:, 1:]
-                    # 37x37 -> 16x16
-                    old_size = int(patch_pe.shape[1] ** 0.5)  # 37
-                    patch_pe = patch_pe.reshape(1, old_size, old_size, 768).permute(0, 3, 1, 2)
-                    patch_pe = nn.functional.interpolate(patch_pe, size=(16, 16), mode="bicubic", align_corners=False)
-                    patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, 256, 768)
-                    new_sd["encoder.pos_embedding"] = torch.cat([cls_pe, patch_pe], dim=1)
-                elif k.startswith("blocks."):
-                    # blocks.0.attn.qkv.weight -> encoder.layers.encoder_layer_0.self_attention...
-                    parts = k.split(".")
-                    layer_idx = parts[1]
-                    rest = ".".join(parts[2:])
-                    prefix = f"encoder.layers.encoder_layer_{layer_idx}"
-                    
-                    if rest == "norm1.weight":
-                        new_sd[f"{prefix}.ln_1.weight"] = v
-                    elif rest == "norm1.bias":
-                        new_sd[f"{prefix}.ln_1.bias"] = v
-                    elif rest == "norm2.weight":
-                        new_sd[f"{prefix}.ln_2.weight"] = v
-                    elif rest == "norm2.bias":
-                        new_sd[f"{prefix}.ln_2.bias"] = v
-                    elif rest == "attn.qkv.weight":
-                        new_sd[f"{prefix}.self_attention.in_proj_weight"] = v
-                    elif rest == "attn.qkv.bias":
-                        new_sd[f"{prefix}.self_attention.in_proj_bias"] = v
-                    elif rest == "attn.proj.weight":
-                        new_sd[f"{prefix}.self_attention.out_proj.weight"] = v
-                    elif rest == "attn.proj.bias":
-                        new_sd[f"{prefix}.self_attention.out_proj.bias"] = v
-                    elif rest == "mlp.fc1.weight":
-                        new_sd[f"{prefix}.mlp.0.weight"] = v
-                    elif rest == "mlp.fc1.bias":
-                        new_sd[f"{prefix}.mlp.0.bias"] = v
-                    elif rest == "mlp.fc2.weight":
-                        new_sd[f"{prefix}.mlp.3.weight"] = v
-                    elif rest == "mlp.fc2.bias":
-                        new_sd[f"{prefix}.mlp.3.bias"] = v
-                elif k == "norm.weight":
-                    new_sd["encoder.ln.weight"] = v
-                elif k == "norm.bias":
-                    new_sd["encoder.ln.bias"] = v
-            
-            missing, unexpected = self.vit.load_state_dict(new_sd, strict=False)
-            loaded = len(new_sd) - len(unexpected)
-            print(f"Loaded DINOv2: {loaded} params mapped, {len(missing)} missing, {len(unexpected)} unexpected")
-        
-        # Freeze all parameters
-        for p in self.vit.parameters():
+                if ".ls1.gamma" in k:
+                    new_sd[k.replace(".ls1.gamma", ".ls1")] = v
+                elif ".ls2.gamma" in k:
+                    new_sd[k.replace(".ls2.gamma", ".ls2")] = v
+                else:
+                    new_sd[k] = v
+
+            # Rename patch_embed.proj -> patch_embed.proj (already matches via Sequential)
+            missing, unexpected = self.load_state_dict(new_sd, strict=False)
+            print(f"DINOv2 loaded: {len(new_sd)} keys, {len(missing)} missing, {len(unexpected)} unexpected")
+            if missing:
+                print(f"  Missing: {missing}")
+            if unexpected:
+                print(f"  Unexpected: {unexpected}")
+
+        for p in self.parameters():
             p.requires_grad = False
 
     def forward(self, x):
-        # Extract features from encoder, bypassing classification head
-        x = self.vit._process_input(x)
-        n = x.shape[0]
-        batch_class_token = self.vit.class_token.expand(n, -1, -1)
-        x = torch.cat([batch_class_token, x], dim=1)
-        x = self.vit.encoder(x)
-        return x[:, 0]  # CLS token, shape [B, 768]
+        B = x.shape[0]
+        # Patch embedding
+        x = self.patch_embed.proj(x)  # [B, 768, H/14, W/14]
+        x = x.flatten(2).transpose(1, 2)  # [B, N, 768]
+
+        # Prepend CLS token
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.pos_embed
+
+        # Transformer blocks
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        return x[:, 0]  # CLS token
 
 
 class ClassIncrementalDINO(nn.Module):
@@ -334,9 +373,19 @@ class ClassIncrementalDINO(nn.Module):
         dino_weights = getattr(cfg, 'dino_weights', '/mnt/datasets/dinov2_vitb14.pth')
         self.use_dino = os.path.exists(dino_weights)
         if self.use_dino:
-            self.dino = DINOv2Encoder(dino_weights, device).to(device)
-            visual_dim = 512 + 768  # CLIP + DINOv2 concatenated
-            print(f"Using CLIP+DINOv2 fusion (dim={visual_dim})")
+            self.dino = DINOv2Encoder(dino_weights, device="cpu")
+            # Inject LoRA BEFORE moving to device so params are registered
+            lora_rank = getattr(cfg, 'lora_rank', 16)
+            lora_targets = getattr(cfg, 'lora_targets', ['qkv', 'proj'])
+            if isinstance(lora_targets, str):
+                lora_targets = [lora_targets]
+            self.lora_params = inject_lora(self.dino, rank=lora_rank, alpha=lora_rank*2, targets=tuple(lora_targets))
+            self.dino = self.dino.to(device)  # now move everything (including LoRA) to device
+            # Update lora_params references to point to CUDA tensors
+            self.lora_params = [p for m in self.dino.modules() if isinstance(m, LoRALinear) for p in [m.lora_A, m.lora_B]]
+            self.old_lora_state = None
+            visual_dim = 512 + 768
+            print(f"Using CLIP+DINOv2 fusion (dim={visual_dim}) with LoRA rank={lora_rank}")
         else:
             visual_dim = 512
             print(f"DINOv2 not found, using CLIP only (dim={visual_dim})")
@@ -344,12 +393,15 @@ class ClassIncrementalDINO(nn.Module):
         # Projection: concat_dim -> 512 (CLIP text space)
         self.adapter = nn.Linear(visual_dim, 512, bias=False, device=device)
         
-        # Override transforms for DINOv2 (224x224, ImageNet normalization)
+        # Keep CLIP transforms as main transforms (used by DataLoader)
+        # Store DINOv2-specific normalization for dual-path encoding
         from torchvision import transforms as T
+        self.dino_normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+        self.clip_normalize = T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
+        # Use a shared preprocessing (resize + to_tensor) without normalization
         self.transforms = T.Compose([
             T.Resize((224, 224)),
             T.ToTensor(),
-            T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         ])
         
         self.class_ids_per_task = list(get_class_ids_per_task(cfg))
@@ -381,12 +433,21 @@ class ClassIncrementalDINO(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         return x
     
-    def encode_image(self, image):
-        # Always use CLIP visual
-        clip_feat = self.visual(image.to(self.clip_type)).float()
+    def encode_image(self, image, allow_lora_grad=False):
+        # Dual-path normalization: each encoder gets its own normalization
+        image_float = image.float()
+        with torch.no_grad():
+            clip_input = self.clip_normalize(image_float).to(self.clip_type)
+            clip_feat = self.visual(clip_input).float()
         if self.use_dino:
-            dino_feat = self.dino(image.float())
-            return torch.cat([clip_feat, dino_feat], dim=-1)  # [B, 1280]
+            dino_input = self.dino_normalize(image_float)
+            if allow_lora_grad:
+                # Allow gradients through LoRA parameters
+                dino_feat = self.dino(dino_input)
+            else:
+                with torch.no_grad():
+                    dino_feat = self.dino(dino_input)
+            return torch.cat([clip_feat, dino_feat.float()], dim=-1)  # [B, 1280]
         return clip_feat
 
     @torch.no_grad()
@@ -398,9 +459,9 @@ class ClassIncrementalDINO(nn.Module):
         with torch.no_grad():
             text_features = self.encode_text(self.text_tokens)
 
-        with torch.no_grad():
-            image_features = self.encode_image(image)
-            original_image_features = image_features.clone()
+        # Allow LoRA gradients during training for real images
+        image_features = self.encode_image(image, allow_lora_grad=self.training)
+        original_image_features = image_features.clone().detach()
         if memory_data is not None:
             memory_data = memory_data.type(self.dtype)
             image_features = torch.cat([image_features, memory_data], dim=0)
@@ -409,7 +470,7 @@ class ClassIncrementalDINO(nn.Module):
             edge_num = edge_sample.shape[0]
             image_features = torch.cat([image_features, edge_sample], dim=0)
 
-        image_features = self.adapter(image_features.type(self.dtype).detach()).type(self.clip_type)
+        image_features = self.adapter(image_features.type(self.dtype)).type(self.clip_type)
 
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         if edge_sample is not None:
@@ -436,9 +497,16 @@ class ClassIncrementalDINO(nn.Module):
 
     def adaptation(self, task_id, threshold=0):
         self.current_class_names += get_class_names(self.classes_names, self.class_ids_per_task[task_id])
-        self.text_tokens = clip.tokenize(
-            [self.prompt_template.format(c) for c in self.current_class_names]
-        ).to(self.device)
+        # Use descriptive names for FGVC-Aircraft if available
+        if self.cfg.dataset == "fgvc_aircraft":
+            descriptive_names = [get_aircraft_descriptive_name(c) for c in self.current_class_names]
+            self.text_tokens = clip.tokenize(
+                [self.prompt_template.format(c) for c in descriptive_names]
+            ).to(self.device)
+        else:
+            self.text_tokens = clip.tokenize(
+                [self.prompt_template.format(c) for c in self.current_class_names]
+            ).to(self.device)
         self.text_end = self.text_tokens.max(dim=-1)[1]
         self.class_name_features = self.get_class_name_features()
         self.class_name_features = self.class_name_features / self.class_name_features.norm(dim=-1, p=2, keepdim=True)
@@ -446,6 +514,9 @@ class ClassIncrementalDINO(nn.Module):
         self.hard_pairs = None
         if task_id > 0:
             self.old_adapter = copy.deepcopy(self.adapter)
+            # Save old LoRA state for replay comparison
+            if self.use_dino and hasattr(self, 'lora_params'):
+                self.old_lora_state = get_lora_state_dict(self.dino)
             dist_list = []
             for k, class_name_feature in enumerate(self.class_name_features[:-len(self.class_ids_per_task[task_id])]):
                 diff = torch.cdist(self.class_name_features[-len(self.class_ids_per_task[task_id]):].type(torch.float32), class_name_feature.unsqueeze(0).type(torch.float32)).squeeze()

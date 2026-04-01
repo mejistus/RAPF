@@ -49,7 +49,12 @@ def run_class_incremental(cfg, device):
         train_loader = DataLoader(train_dataset[task_id], batch_size=cfg.train_batch_size, shuffle=True, num_workers=cfg.num_workers)
         # epoch
         model.train()
-        optimizer = torch.optim.Adam(model.adapter.parameters(), lr=cfg.lr, weight_decay=0.0000)
+        # Build parameter groups: adapter + optional LoRA params (LoRA only for task 0)
+        param_groups = [{"params": model.adapter.parameters(), "lr": cfg.lr}]
+        lora_lr = getattr(cfg, 'lora_lr', cfg.lr * 0.5)
+        if task_id == 0 and hasattr(model, 'lora_params') and len(model.lora_params) > 0:
+            param_groups.append({"params": model.lora_params, "lr": lora_lr})
+        optimizer = torch.optim.Adam(param_groups, weight_decay=0.0000)
 
         milestones = cfg.milestones
         epochs = cfg.epochs
@@ -129,6 +134,12 @@ def run_class_incremental(cfg, device):
                 tqdm_loader.set_description(f"Epoch {i_epoch + 1}/{cfg.epochs} | Loss: {loss.item():.4f} | Loss_c: {loss_c.item():.4f}| loss_hinge: {loss_hinge.item():.4f} | lr: {scheduler.get_last_lr()[0]:.4f}")
             
             scheduler.step()
+        # After task 0 training: freeze LoRA so features stay stable for replay
+        if task_id == 0 and hasattr(model, 'lora_params'):
+            for p in model.lora_params:
+                p.requires_grad = False
+            logging.info("LoRA frozen after task 0 warmup")
+
         sample_loader = DataLoader(train_dataset[task_id], batch_size=128, shuffle=False, num_workers=cfg.num_workers)
         sample_data = []
         sample_target = []

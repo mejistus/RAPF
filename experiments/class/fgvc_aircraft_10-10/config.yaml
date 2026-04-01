@@ -1,0 +1,24 @@
+class_order: ../../../class_orders/fgvc_aircraft_order_shuffle.yaml
+dataset_root: /home/markov/Documents/Github/RAPF/data/fgvc_aircraft
+workdir: /home/markov/Documents/Github/RAPF
+log_path: metric.json
+model_name: ViT-B/16
+prompt_template: a photo of {} airplane.
+batch_size: 128
+initial_increment: 10
+increment: ${initial_increment}
+scenario: class
+dataset: fgvc_aircraft
+num_workers: 16
+train_batch_size: 64
+epochs: 15
+lr: 0.001
+fp16: false
+seed: 2
+milestones:
+- 4
+- 10
+beta: 2
+mix_bias: 0.6
+threshold: 0.55
+shrinkage: true

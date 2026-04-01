@@ -1,0 +1,2 @@
+- dataset_root=data/fgvc_aircraft
+- class_order=class_orders/fgvc_aircraft_order.yaml

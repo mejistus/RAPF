@@ -1,0 +1,23 @@
+{
+  "dino_weights": "/mnt/datasets/dinov2_vitb14.pth",
+  "lora_rank": 8,
+  "proj_dim": 128,
+  "P": 8,
+  "K": 8,
+  "epochs": 80,
+  "lr": 0.001,
+  "lr_lora": 0.0005,
+  "warmup_epochs": 5,
+  "temperature": 0.1,
+  "lambda_cl": 4.0,
+  "local_weight": 0.5,
+  "hard_weight": 3.0,
+  "label_smoothing": 0.1,
+  "weight_decay": 0.0005,
+  "num_workers": 4,
+  "seed": 42,
+  "grad_clip": 1.0,
+  "data_root": "../data/fgvc_mild",
+  "tag": "Mild (97 cls)",
+  "num_classes": 97
+}
