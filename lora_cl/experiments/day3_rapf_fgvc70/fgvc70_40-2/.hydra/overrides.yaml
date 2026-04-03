@@ -1,0 +1,2 @@
+- dataset_root=data/fgvc_moderate_v2
+- class_order=class_orders/fgvc_moderate_v2_order_shuffle.yaml

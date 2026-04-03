@@ -1,0 +1,2 @@
+- dataset_root=data/fgvc_aggressive
+- class_order=class_orders/fgvc_aggressive_order_shuffle.yaml

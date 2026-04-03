@@ -132,6 +132,14 @@ def get_dataset(cfg, is_train, transforms=None):
             train=is_train
         )
         classes_names = get_dataset_class_names(cfg.workdir, cfg.dataset)
+    elif cfg.dataset == "fgvc_moderate_v2":
+        data_path = cfg.dataset_root
+        dataset = MAR20(data_path, train=is_train)
+        classes_names = get_dataset_class_names(cfg.workdir, cfg.dataset)
+    elif cfg.dataset == "fgvc_aggressive":
+        data_path = cfg.dataset_root
+        dataset = MAR20(data_path, train=is_train)
+        classes_names = get_dataset_class_names(cfg.workdir, cfg.dataset)
     elif cfg.dataset == "fgvc_aircraft":
         data_path = cfg.dataset_root
         dataset = MAR20(data_path, train=is_train)  # same folder structure as MAR20

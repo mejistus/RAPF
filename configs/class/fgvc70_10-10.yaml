@@ -1,0 +1,37 @@
+hydra:
+  run:
+    dir: ./lora_cl/experiments/day3_rapf_fgvc70/fgvc70_10-10
+  job:
+    chdir: true
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "%(message)s"
+class_order: ""
+dataset_root: ""
+workdir: ""
+log_path: "metric.json"
+model_name: "ViT-B/16"
+prompt_template: "a photograph of a {}."
+use_dino: true
+dino_weights: "/mnt/datasets/dinov2_vitb14.pth"
+lora_rank: 16
+lora_targets: [qkv, proj]
+lora_lr: 0.00025
+batch_size: 128
+initial_increment: 10
+increment: 10
+scenario: "class"
+dataset: "fgvc_moderate_v2"
+num_workers: 4
+train_batch_size: 64
+epochs: 20
+lr: 0.0005
+fp16: false
+seed: 2
+milestones: [8, 15]
+beta: 2
+mix_bias: 0.6
+threshold: 0.55
+shrinkage: true
